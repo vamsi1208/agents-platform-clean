@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Agents Platform Implementation & Deployment Guide</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; padding: 0; background: #f5f7fb; color: #111; }
+    .container { max-width: 980px; margin: 0 auto; padding: 32px; }
+    h1 { margin-bottom: 0.25em; }
+    p { line-height: 1.7; }
+    .accordion { border-radius: 12px; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.08); margin-bottom: 16px; background: #fff; }
+    .accordion summary { cursor: pointer; list-style: none; padding: 20px 24px; display: flex; justify-content: space-between; align-items: center; font-size: 1.05rem; border-bottom: 1px solid #e3e8ee; }
+    .accordion summary::-webkit-details-marker { display: none; }
+    .accordion summary::after { content: '▾'; font-size: 1.2rem; transition: transform 0.2s ease; }
+    .accordion[open] summary::after { transform: rotate(180deg); }
+    .accordion .content { padding: 0 24px 24px; }
+    .section-title { margin: 0.75rem 0 0.5rem; font-size: 1rem; font-weight: 700; }
+    pre { background: #0f172a; color: #d8dee9; padding: 16px; border-radius: 10px; overflow-x: auto; font-size: 0.92rem; }
+    code { font-family: 'Courier New', monospace; }
+    .note { background: #eef6ff; border-left: 4px solid #0078d4; padding: 14px 18px; margin: 16px 0; border-radius: 8px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+    .badge { display: inline-flex; align-items: center; gap: 0.4rem; background: #e2f4ff; color: #042b54; padding: 0.35rem 0.85rem; border-radius: 999px; font-size: 0.88rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Agents Platform Guide</h1>
+    <p>Everything you need to understand implementation, runtime flow, and deployment for the Agents Platform project.</p>
+
+    <details class="accordion" open>
+      <summary>1. Architecture Overview</summary>
+      <div class="content">
+        <p>This platform delivers a React frontend, Cognito authentication, API Gateway, multiple Lambda agents, Bedrock model calls, and DynamoDB session storage.</p>
+        <div class="section-title">Key components</div>
+        <ul>
+          <li><strong>CloudFront + S3 frontend:</strong> serves the React single-page app.</li>
+          <li><strong>Cognito User Pool:</strong> handles sign-up/login and JWT issuance.</li>
+          <li><strong>API Gateway:</strong> exposes authenticated REST endpoints under <code>/agents/*</code>.</li>
+          <li><strong>Lambda agents:</strong> </li>
+          <ul>
+            <li><code>test-case-agent</code></li>
+            <li><code>playwright-agent</code></li>
+            <li><code>history-agent</code></li>
+          </ul>
+          <li><strong>Bedrock:</strong> model inference service used by the first two agents.</li>
+          <li><strong>DynamoDB:</strong> stores session history for agent calls.</li>
+        </ul>
+
+        <div class="section-title">Request flow</div>
+        <pre><code>React UI -> CloudFront -> API Gateway -> Lambda -> Bedrock/DynamoDB -> API Gateway -> React UI</code></pre>
+      </div>
+    </details>
+
+    <details class="accordion">
+      <summary>2. Frontend Implementation</summary>
+      <div class="content">
+        <div class="section-title">Frontend structure</div>
+        <p>Located in <code>agents-platform/frontend</code>. It is a React + Vite app with Amplify configuration and Axios for API requests.</p>
+
+        <div class="section-title">Auth setup</div>
+        <p><code>src/lib/amplify.ts</code> initializes Cognito configuration using Vite env variables:</p>
+        <pre><code>import { Amplify } from 'aws-amplify';
+
+Amplify.configure({
+  Auth: {
+    Cognito: {
+      userPoolId: import.meta.env.VITE_USER_POOL_ID,
+      userPoolClientId: import.meta.env.VITE_USER_POOL_CLIENT_ID,
+    },
+  },
+});</code></pre>
+
+        <div class="section-title">API client</div>
+        <p><code>src/lib/api.ts</code> creates an Axios client with automatic Cognito JWT injection:</p>
+        <pre><code>import axios from 'axios';
+import { fetchAuthSession } from 'aws-amplify/auth';
+
+const api = axios.create({ baseURL: import.meta.env.VITE_API_URL });
+
+api.interceptors.request.use(async (config) => {
+  const session = await fetchAuthSession();
+  const token = session.tokens?.idToken?.toString();
+  if (token) config.headers.Authorization = token;
+  return config;
+});
+
+export default api;</code></pre>
+
+        <div class="section-title">Agent page UI</div>
+        <p><code>src/components/AgentPage.tsx</code> renders the input box, submit flow, and markdown output for any agent.</p>
+        <pre><code>const res = await api.post(endpoint, { input });
+setOutput(res.data.output);</code></pre>
+      </div>
+    </details>
+
+    <details class="accordion">
+      <summary>3. Backend Lambda Agents</summary>
+      <div class="content">
+        <div class="section-title">Common behavior</div>
+        <p>All Lambda agent handlers parse JSON input, call AWS Bedrock or DynamoDB, store session history, and return JSON.</p>
+        <div class="note">The API Gateway authorizer injects Cognito claims into <code>event.requestContext.authorizer.claims</code>. The Lambda uses that to set <code>userId</code>.</div>
+
+        <div class="section-title">Test case agent</div>
+        <p>Implemented in <code>backend/agents/test-case-agent/handler.js</code>. It:</p>
+        <ul>
+          <li>reads <code>event.body.input</code></li>
+          <li>invokes Bedrock with a QA prompt</li>
+          <li>stores results in DynamoDB</li>
+          <li>returns <code>{ sessionId, output }</code></li>
+        </ul>
+        <pre><code>const response = await bedrock.send(new ConverseCommand({
+  modelId: process.env.BEDROCK_MODEL_ID,
+  system: [{ text: SYSTEM_PROMPT }],
+  messages: [{ role: 'user', content: [{ text: input }] }],
+  inferenceConfig: { maxTokens: 2048 },
+}));</code></pre>
+
+        <div class="section-title">Playwright agent</div>
+        <p>In <code>backend/agents/playwright-agent/handler.js</code>. It behaves similarly but prompts for a runnable Playwright script instead of test cases.</p>
+
+        <div class="section-title">History agent</div>
+        <p>In <code>backend/agents/history-agent/handler.js</code>. It queries the DynamoDB table by <code>userId</code> and returns the last 20 sessions.</p>
+      </div>
+    </details>
+
+    <details class="accordion">
+      <summary>4. Infrastructure & Deployment</summary>
+      <div class="content">
+        <div class="section-title">CDK stack</div>
+        <p>Located in <code>agents-platform/infrastructure/lib/infrastructure-stack.ts</code>.</p>
+        <div class="grid">
+          <div><span class="badge">Cognito</span></div>
+          <div><span class="badge">DynamoDB</span></div>
+          <div><span class="badge">Lambda</span></div>
+          <div><span class="badge">API Gateway</span></div>
+          <div><span class="badge">S3</span></div>
+          <div><span class="badge">CloudFront</span></div>
+        </div>
+
+        <div class="section-title">CDK Lambda config</div>
+        <pre><code>const testCaseFn = new lambda.Function(this, 'TestCaseAgentFn', {
+  runtime: lambda.Runtime.NODEJS_20_X,
+  handler: 'handler.handler',
+  code: lambda.Code.fromAsset(path.join(__dirname, '../../backend/agents/test-case-agent'), { exclude: ['*.ts', 'tsconfig.json'] }),
+  role: lambdaRole,
+  timeout: cdk.Duration.seconds(30),
+  memorySize: 256,
+  environment: lambdaEnv,
+});</code></pre>
+
+        <div class="section-title">API routes</div>
+        <pre><code>agents.addResource('test-case').addMethod('POST', new LambdaIntegration(testCaseFn), authOptions);
+agents.addResource('playwright').addMethod('POST', new LambdaIntegration(playwrightFn), authOptions);
+agents.addResource('history').addMethod('GET', new LambdaIntegration(historyFn), authOptions);</code></pre>
+
+        <div class="section-title">Deployment steps</div>
+        <ol>
+          <li>Open terminal in <code>agents-platform/infrastructure</code>.</li>
+          <li>Run <code>npm install</code> if not installed.</li>
+          <li>Run <code>npm run build</code> to compile the CDK TypeScript stack.</li>
+          <li>Run <code>npx cdk deploy</code> (or <code>npm run cdk deploy</code>).</li>
+          <li>Note CDK outputs: <code>CloudFrontURL</code>, <code>ApiGatewayURL</code>, <code>UserPoolId</code>, <code>UserPoolClientId</code>, <code>FrontendBucketName</code>.</li>
+          <li>Update frontend env variables in <code>frontend/.env.local</code> or Vite environment with those outputs.</li>
+          <li>Build frontend: <code>cd ../frontend && npm install && npm run build</code>.</li>
+          <li>Deploy static files: <code>aws s3 sync dist/ s3://&lt;bucket-name&gt;</code>.</li>
+          <li>Open the CloudFront URL in a browser.</li>
+        </ol>
+      </div>
+    </details>
+
+    <details class="accordion">
+      <summary>5. Testing and Troubleshooting</summary>
+      <div class="content">
+        <div class="section-title">Local test script</div>
+        <p><code>agents-platform/test-api.js</code> shows how the system is exercised using Cognito and API Gateway.</p>
+        <pre><code>const USER_POOL_ID = 'us-east-1_Aoxgqntxz';
+const CLIENT_ID = '5b7kb05lkkti1s91lb8o1n3im5';
+const API_URL = 'https://a3i7g4cl61.execute-api.us-east-1.amazonaws.com/prod';</code></pre>
+        <p>It authenticates via Cognito and calls <code>/agents/test-case</code>.</p>
+
+        <div class="section-title">Common failure points</div>
+        <ul>
+          <li><strong>Cognito auth failure:</strong> invalid credentials or wrong client config.</li>
+          <li><strong>API Gateway 500:</strong> Lambda error, usually from Bedrock failures or invalid input parsing.</li>
+          <li><strong>Bad env vars:</strong> Lambda expects <code>TABLE_NAME</code>, <code>BEDROCK_MODEL_ID</code>, <code>BEDROCK_REGION</code>.</li>
+          <li><strong>Permissions:</strong> Lambda needs Bedrock and DynamoDB access in its IAM role.</li>
+        </ul>
+
+        <div class="section-title">Debugging tips</div>
+        <ul>
+          <li>Check CloudWatch logs for the failing Lambda.</li>
+          <li>Confirm API Gateway method request and integration settings.</li>
+          <li>Validate the Authorization header is the Cognito ID token, not an access token.</li>
+          <li>Inspect CloudFront/S3 access if the frontend does not load.</li>
+        </ul>
+      </div>
+    </details>
+
+    <details class="accordion">
+      <summary>6. Environment variables and config</summary>
+      <div class="content">
+        <div class="section-title">Lambda env vars</div>
+        <pre><code>const lambdaEnv = {
+  TABLE_NAME: sessionsTable.tableName,
+  BEDROCK_MODEL_ID: 'us.amazon.nova-lite-v1:0',
+  BEDROCK_REGION: 'us-west-2',
+};</code></pre>
+
+        <div class="section-title">Frontend env vars</div>
+        <ul>
+          <li><code>VITE_API_URL</code>: API Gateway base URL</li>
+          <li><code>VITE_USER_POOL_ID</code>: Cognito User Pool ID</li>
+          <li><code>VITE_USER_POOL_CLIENT_ID</code>: Cognito App Client ID</li>
+        </ul>
+
+        <div class="note">The frontend reads these from Vite env, and the API client adds <code>Authorization</code> automatically when signed in.</div>
+      </div>
+    </details>
+
+    <details class="accordion">
+      <summary>7. Source locations</summary>
+      <div class="content">
+        <div class="grid">
+          <div>
+            <strong>Frontend</strong>
+            <ul>
+              <li><code>frontend/src/lib/api.ts</code></li>
+              <li><code>frontend/src/lib/amplify.ts</code></li>
+              <li><code>frontend/src/components/AgentPage.tsx</code></li>
+            </ul>
+          </div>
+          <div>
+            <strong>Backend</strong>
+            <ul>
+              <li><code>backend/agents/test-case-agent/handler.js</code></li>
+              <li><code>backend/agents/playwright-agent/handler.js</code></li>
+              <li><code>backend/agents/history-agent/handler.js</code></li>
+            </ul>
+          </div>
+          <div>
+            <strong>Infrastructure</strong>
+            <ul>
+              <li><code>infrastructure/lib/infrastructure-stack.ts</code></li>
+              <li><code>infrastructure/bin/infrastructure.ts</code></li>
+              <li><code>infrastructure/package.json</code></li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </details>
+  </div>
+</body>
+</html>
